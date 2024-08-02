@@ -1,0 +1,142 @@
+INSTALLED_APPS = [
+    ...
+    'channels',
+    'chat',
+]
+
+# Configure Channels
+ASGI_APPLICATION = 'mysite.asgi.application'
+
+
+
+chat/models.py
+from django.contrib.auth import get_user_model
+from django.db import models
+
+User = get_user_model()
+
+class Message(models.Model):
+    sender = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sent_messages')
+    recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name='received_messages')
+    content = models.TextField()
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.sender} to {self.recipient}: {self.content[:20]}"
+
+
+
+//serializer
+from rest_framework import serializers
+from .models import Message
+
+class MessageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Message
+        fields = ['id', 'sender', 'recipient', 'content', 'timestamp']
+
+
+//serializer.py
+from rest_framework import generics, permissions
+from .models import Message
+from .serializers import MessageSerializer
+
+class MessageListCreateView(generics.ListCreateAPIView):
+    queryset = Message.objects.all()
+    serializer_class = MessageSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_superuser:
+            return Message.objects.filter(recipient=user)
+        return Message.objects.filter(sender=user)
+
+    def perform_create(self, serializer):
+        recipient_id = self.request.data.get('recipient_id')
+        recipient = User.objects.get(id=recipient_id)
+        serializer.save(sender=self.request.user, recipient=recipient)
+
+chat/urls.py
+from django.urls import path
+from .views import MessageListCreateView
+
+urlpatterns = [
+    path('messages/', MessageListCreateView.as_view(), name='message-list-create'),
+]
+
+
+//mysite.urls
+from django.contrib import admin
+from django.urls import path, include
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('api/', include('chat.urls')),
+]
+
+
+
+//chat/consumer.py
+import json
+from channels.generic.websocket import AsyncWebsocketConsumer
+from .models import Message
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
+
+class ChatConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        self.user = self.scope["user"]
+        self.room_group_name = f"chat_{self.user.id}"
+
+        await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+        await self.accept()
+
+    async def disconnect(self, close_code):
+        await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+
+    async def receive(self, text_data):
+        data = json.loads(text_data)
+        message = data['message']
+        recipient_id = data['recipient_id']
+        recipient = await User.objects.get(id=recipient_id)
+
+        new_message = Message.objects.create(
+            sender=self.user,
+            recipient=recipient,
+            content=message
+        )
+
+        await self.channel_layer.group_send(
+            f"chat_{recipient.id}",
+            {
+                'type': 'chat_message',
+                'message': message,
+                'sender': self.user.username
+            }
+        )
+
+        await self.send(text_data=json.dumps({
+            'message': message,
+            'recipient': recipient.username,
+            'sender': self.user.username
+        }))
+
+    async def chat_message(self, event):
+        message = event['message']
+        sender = event['sender']
+
+        await self.send(text_data=json.dumps({
+            'message': message,
+            'sender': sender
+        }))
+
+
+//chat/routing.py
+from django.urls import re_path
+from .consumers import ChatConsumer
+
+websocket_urlpatterns = [
+    re_path(r'ws/chat/(?P<user_id>\d+)/$', ChatConsumer.as_asgi()),
+]
